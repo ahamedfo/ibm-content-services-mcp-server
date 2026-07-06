@@ -127,11 +127,13 @@ def register_easement_tools(mcp: FastMCP) -> None:
             (east/west for north/south edges; north/south for east/west edges). Default east.
 
         :returns: If successful, returns a dictionary containing:
-            - parcel (dict): apn, owner, and the matched edge length in feet.
-            - traverse (dict): closure_ft, closure_precision (e.g. "1:44079"), area_sqft.
-            - pob (dict): lat/lon of the Point of Beginning.
-            - geojson (dict): FeatureCollection with the parcel and easement polygons,
-              ready for geojson.io or any GIS system.
+            - summary (dict): flat result fields — apn, parcel_owner, county,
+              matched_edge, matched_edge_length_ft, closure_ft, closure_precision,
+              easement_area_sqft, pob_lat, pob_lon. Report these values verbatim.
+            - geojson_io_url (str): a ready-made link that opens the exact polygons
+              on an interactive map. Present it as a link; NEVER re-type coordinates.
+            - geojson (dict): full-precision FeatureCollection for programmatic
+              consumers only — do not reproduce it in a chat response.
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "map_easement_to_parcel"
@@ -315,19 +317,60 @@ def register_easement_tools(mcp: FastMCP) -> None:
                 pob_lat,
                 pob_lon,
             )
+
+            # Pre-built geojson.io link so no client (human or LLM) ever has to
+            # re-type coordinates. 6-decimal coords (~0.1 m) keep the URL compact.
+            def _round_ring(r, nd=6):
+                return [[round(lon, nd), round(lat, nd)] for lon, lat in r]
+
+            compact = {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"name": f"Parcel {apn}", "fill-opacity": 0.08},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [_round_ring(ring)],
+                        },
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "name": "Easement",
+                            "fill": "#b2182b",
+                            "fill-opacity": 0.45,
+                        },
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [_round_ring(easement_ring)],
+                        },
+                    },
+                ],
+            }
+            geojson_io_url = (
+                "https://geojson.io/#data=data:application/json,"
+                + quote(json.dumps(compact, separators=(",", ":")))
+            )
+
             return {
-                "parcel": {
+                # Flat, small, safe for an LLM to relay verbatim in chat.
+                "summary": {
                     "apn": apn,
-                    "owner": owner,
+                    "parcel_owner": owner,
+                    "county": county,
                     "matched_edge": pob_edge,
                     "matched_edge_length_ft": round(edge_len_ft, 2),
-                },
-                "traverse": {
                     "closure_ft": round(closure_ft, 3),
                     "closure_precision": precision,
-                    "area_sqft": round(area_sqft, 1),
+                    "easement_area_sqft": round(area_sqft, 1),
+                    "pob_lat": round(pob_lat, 7),
+                    "pob_lon": round(pob_lon, 7),
                 },
-                "pob": {"lat": round(pob_lat, 8), "lon": round(pob_lon, 8)},
+                # Single opaque link — click to view the exact polygons on a map.
+                "geojson_io_url": geojson_io_url,
+                # Full-precision payload for programmatic consumers (front-ends
+                # should read this from the tool-call event, not from chat text).
                 "geojson": geojson,
             }
 
