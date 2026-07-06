@@ -58,6 +58,19 @@ from cs_mcp_server.utils.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_identifier(identifier: str) -> str:
+    """Normalize a document identifier before it reaches the repository.
+
+    Some agent runtimes (e.g. watsonx Orchestrate) template-escape braces in
+    prompts, so a GUID like {ABC...} arrives as {{ABC...}}. Collapse doubled
+    braces and trim whitespace so the first repository call succeeds.
+    """
+    ident = (identifier or "").strip()
+    while ident.startswith("{{") and ident.endswith("}}"):
+        ident = ident[1:-1]
+    return ident
+
+
 def register_document_tools(
     mcp: FastMCP, graphql_client: GraphQLClient, metadata_cache: MetadataCache
 ) -> None:
@@ -80,6 +93,8 @@ def register_document_tools(
                         - minorVersionNumber (int): The minor version number. The format to print out version number is majorVersionNumber.minorVersionNumber.
                         - id (str): The unique identifier of the version's document id.
         """
+        identifier = _normalize_identifier(identifier)
+
         query = """
         query getDocumentVersions($object_store_name: String!, $identifier: String!){
             document(
@@ -121,7 +136,7 @@ def register_document_tools(
                  Returns an empty string if no text extract is found.
         """
         return await get_document_text_extract_content(
-            graphql_client=graphql_client, identifier=identifier
+            graphql_client=graphql_client, identifier=_normalize_identifier(identifier)
         )
 
     @mcp.tool(
@@ -468,6 +483,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "checkin_document"
+        identifier = _normalize_identifier(identifier)
         try:
             # Prepare the mutation
             mutation = """
@@ -608,6 +624,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "checkout_document"
+        identifier = _normalize_identifier(identifier)
         try:
             # Prepare the mutation
             mutation = """
@@ -912,6 +929,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "get_document"
+        identifier = _normalize_identifier(identifier)
         try:
             # Prepare the query
             query = """
@@ -1005,6 +1023,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "download_document_content"
+        identifier = _normalize_identifier(identifier)
         try:
             # Prepare the query -- unlike checkoutDocument, this is a plain read
             # and places no reservation on the document
@@ -1177,6 +1196,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "get_document_pdf_text"
+        identifier = _normalize_identifier(identifier)
         try:
             # Same read-only content query used by download_document_content
             query = """
@@ -1304,6 +1324,7 @@ def register_document_tools(
                  If unsuccessful, returns a ToolError with details about the failure.
         """
         method_name = "cancel_document_checkout"
+        identifier = _normalize_identifier(identifier)
         try:
             # Prepare the mutation
             mutation = """
