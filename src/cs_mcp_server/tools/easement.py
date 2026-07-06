@@ -321,22 +321,34 @@ def register_easement_tools(mcp: FastMCP) -> None:
             # Pre-built geojson.io link so no client (human or LLM) ever has to
             # re-type coordinates. Chat UIs truncate long URLs, so keep it SMALL:
             # drop collinear vertices, 5-decimal coords (~1 m), minimal properties.
-            def _simplify_ring(r):
-                if len(r) < 5:
-                    return r
-                pts = r[:-1]  # open the ring
-                kept = []
-                n = len(pts)
-                for i in range(n):
-                    px, py = pts[(i - 1) % n]
-                    vx, vy = pts[i]
-                    nx, ny = pts[(i + 1) % n]
-                    cross = (vx - px) * (ny - py) - (vy - py) * (nx - px)
-                    if abs(cross) > 1e-11:  # keep only real corners
-                        kept.append(pts[i])
-                if len(kept) < 3:
-                    kept = pts
-                return kept + [kept[0]]
+            def _dp(pts, eps):
+                # Douglas-Peucker: robust against corners split across
+                # clustered survey points (unlike local collinearity tests).
+                if len(pts) < 3:
+                    return pts
+                ax, ay = pts[0]
+                bx, by = pts[-1]
+                dx, dy = bx - ax, by - ay
+                dmax, idx = 0.0, 0
+                for i in range(1, len(pts) - 1):
+                    px, py = pts[i]
+                    if dx == 0 and dy == 0:
+                        dist = math.hypot(px - ax, py - ay)
+                    else:
+                        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+                        dist = math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+                    if dist > dmax:
+                        dmax, idx = dist, i
+                if dmax <= eps:
+                    return [pts[0], pts[-1]]
+                left = _dp(pts[: idx + 1], eps)
+                right = _dp(pts[idx:], eps)
+                return left[:-1] + right
+
+            def _simplify_ring(r, eps=2e-6):  # ~0.2 m
+                closed = r if r[0] == r[-1] else list(r) + [r[0]]
+                out = _dp(closed, eps)
+                return out if len(out) >= 4 else closed
 
             def _round_ring(r, nd=5):
                 out = []
