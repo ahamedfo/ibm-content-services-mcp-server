@@ -15,6 +15,8 @@
 """Easement mapping tools: place a survey traverse from a recorded easement
 document onto real-world coordinates using county parcel GIS data."""
 
+import base64
+import gzip
 import json
 import logging
 import math
@@ -381,10 +383,12 @@ def register_easement_tools(mcp: FastMCP) -> None:
                     },
                 ],
             }
-            geojson_io_url = (
-                "https://geojson.io/#data=data:application/json,"
-                + quote(json.dumps(compact, separators=(",", ":")))
-            )
+            # gzip + base64url ("gz:" scheme): the URL contains only [A-Za-z0-9-_],
+            # so chat UIs cannot mangle it the way they break percent-encoded
+            # payloads (quote-terminated hrefs), and it is ~half the size.
+            raw = json.dumps(compact, separators=(",", ":")).encode()
+            packed = base64.urlsafe_b64encode(gzip.compress(raw, mtime=0)).decode().rstrip("=")
+            geojson_io_url = "https://geojson.io/?data=gz:" + packed
 
             return {
                 # Flat, small, safe for an LLM to relay verbatim in chat.
