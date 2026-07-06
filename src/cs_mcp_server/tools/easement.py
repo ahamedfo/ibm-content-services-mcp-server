@@ -319,28 +319,49 @@ def register_easement_tools(mcp: FastMCP) -> None:
             )
 
             # Pre-built geojson.io link so no client (human or LLM) ever has to
-            # re-type coordinates. 6-decimal coords (~0.1 m) keep the URL compact.
-            def _round_ring(r, nd=6):
-                return [[round(lon, nd), round(lat, nd)] for lon, lat in r]
+            # re-type coordinates. Chat UIs truncate long URLs, so keep it SMALL:
+            # drop collinear vertices, 5-decimal coords (~1 m), minimal properties.
+            def _simplify_ring(r):
+                if len(r) < 5:
+                    return r
+                pts = r[:-1]  # open the ring
+                kept = []
+                n = len(pts)
+                for i in range(n):
+                    px, py = pts[(i - 1) % n]
+                    vx, vy = pts[i]
+                    nx, ny = pts[(i + 1) % n]
+                    cross = (vx - px) * (ny - py) - (vy - py) * (nx - px)
+                    if abs(cross) > 1e-11:  # keep only real corners
+                        kept.append(pts[i])
+                if len(kept) < 3:
+                    kept = pts
+                return kept + [kept[0]]
+
+            def _round_ring(r, nd=5):
+                out = []
+                for lon, lat in r:
+                    p = [round(lon, nd), round(lat, nd)]
+                    if not out or out[-1] != p:
+                        out.append(p)
+                if out[-1] != out[0]:
+                    out.append(out[0])  # GeoJSON rings must be closed
+                return out
 
             compact = {
                 "type": "FeatureCollection",
                 "features": [
                     {
                         "type": "Feature",
-                        "properties": {"name": f"Parcel {apn}", "fill-opacity": 0.08},
+                        "properties": {"fill-opacity": 0.05},
                         "geometry": {
                             "type": "Polygon",
-                            "coordinates": [_round_ring(ring)],
+                            "coordinates": [_round_ring(_simplify_ring(ring))],
                         },
                     },
                     {
                         "type": "Feature",
-                        "properties": {
-                            "name": "Easement",
-                            "fill": "#b2182b",
-                            "fill-opacity": 0.45,
-                        },
+                        "properties": {"fill": "#b2182b", "fill-opacity": 0.5},
                         "geometry": {
                             "type": "Polygon",
                             "coordinates": [_round_ring(easement_ring)],
