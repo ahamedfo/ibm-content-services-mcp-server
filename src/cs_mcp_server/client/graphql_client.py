@@ -1559,6 +1559,82 @@ class GraphQLClient(GraphqlConnection):
 
         return result
 
+    async def download_content_bytes_async(self, download_url: str) -> bytes:
+        """
+        Download content from a URL asynchronously and return it as bytes in memory.
+
+        Unlike download_content_async, nothing is written to disk — use this when
+        the content is processed in-process (e.g. PDF text extraction).
+
+        Args:
+            download_url: The download URL path to append to the base URL (replacing '/graphql')
+
+        Returns:
+            The raw content bytes.
+
+        Raises:
+            Exception: If the download fails after retries.
+        """
+        # Check if token needs to be refreshed
+        token_refreshed = await self._check_token_refresh()
+        if token_refreshed:
+            logger.debug("Token refreshed before downloading content bytes")
+
+        # Prepare URL, headers, cookies and authentication
+        url = self._prepare_download_url(download_url)
+        headers = self._prepare_headers(include_content_type=False)
+        cookies = self._prepare_cookies()
+        auth = self._prepare_auth(is_async=True)
+
+        session = await self._ensure_session()
+
+        retries = 0
+        while True:
+            try:
+                # Apply rate limiting
+                rate_limit_coro = self._apply_rate_limiting(is_async=True)
+                if rate_limit_coro:
+                    await rate_limit_coro
+
+                async with session.get(
+                    url=url,
+                    headers=headers,
+                    cookies=cookies,
+                    auth=auth,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    ssl=False if self.ssl_enabled == False else None,
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(
+                            f"Request failed with status code: {response.status}. Response: {error_text}"
+                        )
+                    return await response.read()
+
+            except (
+                aiohttp.ClientConnectorError,
+                aiohttp.ClientResponseError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as e:
+                retries += 1
+                if retries > self.max_retries:
+                    logger.error(
+                        "Content bytes download failed after %d retries: %s",
+                        self.max_retries,
+                        str(e),
+                    )
+                    raise
+                delay = self.retry_delay * (2 ** (retries - 1))
+                logger.warning(
+                    "Download attempt failed: %s. Retrying in %.1f seconds (attempt %d/%d)",
+                    str(e),
+                    delay,
+                    retries,
+                    self.max_retries,
+                )
+                await asyncio.sleep(delay)
+
 
 async def graphql_client_execute_async_wrapper (
     logger: Logger,

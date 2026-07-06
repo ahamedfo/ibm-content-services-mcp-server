@@ -1148,6 +1148,146 @@ def register_document_tools(
             )
 
     @mcp.tool(
+        name="get_document_pdf_text",
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    async def get_document_pdf_text(
+        identifier: str,
+    ) -> Union[Dict[str, Any], ToolError]:
+        """
+        Extracts the embedded text of a PDF document directly from its content bytes.
+
+        Unlike get_document_text_extract (which depends on text extract annotations
+        created by the repository's text extraction service), this tool downloads the
+        PDF content in memory and extracts its embedded text layer directly. It is
+        read-only: no reservation/lock is placed and nothing is written to disk.
+        Use it when a PDF's text is needed but no text extract annotation exists.
+
+        Note: scanned PDFs with no embedded text layer will return empty pages —
+        those require OCR or a vision model instead.
+
+        :param identifier: The document id or path (required). This can be either the document's ID (GUID)
+                          or its path in the repository (e.g., "/Folder1/document.pdf").
+
+        :returns: If successful, returns a dictionary containing:
+            - document_id (str): The document's ID.
+            - page_count (int): Number of pages in the PDF.
+            - characters (int): Total characters extracted.
+            - text (str): The extracted text, with pages separated by form-feed markers.
+                 If unsuccessful, returns a ToolError with details about the failure.
+        """
+        method_name = "get_document_pdf_text"
+        try:
+            # Same read-only content query used by download_document_content
+            query = """
+            query ($object_store_name: String!, $identifier: String!) {
+                document(repositoryIdentifier: $object_store_name, identifier: $identifier) {
+                    id
+                    className
+                    currentVersion{
+                        contentElements{
+                            ... on ContentTransferType {
+                                retrievalName
+                                contentType
+                                contentSize
+                                downloadUrl
+                            }
+                        }
+                    }
+                }
+            }
+            """
+
+            variables = {
+                "object_store_name": graphql_client.object_store,
+                "identifier": identifier,
+            }
+
+            logger.info("Executing document PDF text extraction")
+            response: Union[ToolError, Dict[str, Any]] = (
+                await graphql_client_execute_async_wrapper(
+                    logger,
+                    method_name,
+                    graphql_client,
+                    query=query,
+                    variables=variables,
+                )
+            )
+            if isinstance(response, ToolError):
+                return response
+
+            if not response.get("data") or not response["data"].get("document"):
+                return ToolError(
+                    message=f"Document not found with identifier: {identifier}",
+                    suggestions=[
+                        "Check if the document ID or path is correct",
+                        "Verify that the document exists in the repository",
+                    ],
+                )
+
+            document = response["data"]["document"]
+            current_version = document.get("currentVersion") or {}
+            content_elements = [
+                element
+                for element in (current_version.get("contentElements") or [])
+                if element.get("downloadUrl")
+            ]
+
+            pdf_elements = [
+                element
+                for element in content_elements
+                if (element.get("contentType") or "").lower() == "application/pdf"
+                or (element.get("retrievalName") or "").lower().endswith(".pdf")
+            ]
+
+            if not pdf_elements:
+                found_types = [element.get("contentType") for element in content_elements]
+                return ToolError(
+                    message=f"Document has no PDF content elements: {identifier} (found: {found_types})",
+                    suggestions=[
+                        "Use get_document_text_extract for documents with text extract annotations",
+                        "Use download_document_content to retrieve non-PDF content",
+                    ],
+                )
+
+            # Download the PDF bytes in memory and extract the embedded text layer
+            from io import BytesIO
+
+            from pypdf import PdfReader
+
+            pages_text: List[str] = []
+            for element in pdf_elements:
+                logger.info(
+                    "Extracting text from PDF content element: %s (%s bytes)",
+                    element.get("retrievalName"),
+                    element.get("contentSize"),
+                )
+                content = await graphql_client.download_content_bytes_async(
+                    download_url=element["downloadUrl"]
+                )
+                reader = PdfReader(BytesIO(content))
+                for page in reader.pages:
+                    pages_text.append(page.extract_text() or "")
+
+            text = "\n\f\n".join(pages_text)
+            logger.info(
+                "Extracted %s characters from %s pages", len(text), len(pages_text)
+            )
+            return {
+                "document_id": document["id"],
+                "page_count": len(pages_text),
+                "characters": len(text),
+                "text": text,
+            }
+
+        except Exception as e:
+            logger.error("%s failed: %s", method_name, str(e))
+            logger.error(traceback.format_exc())
+            return ToolError(
+                message=f"{method_name} failed: {str(e)}. Trace available in server logs."
+            )
+
+    @mcp.tool(
         name="cancel_document_checkout",
     )
     async def cancel_document_checkout(
