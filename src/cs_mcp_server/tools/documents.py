@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import traceback
 import re
 from typing import Any, List, Optional, Union, Dict
@@ -964,6 +965,180 @@ def register_document_tools(
                     "className", DEFAULT_DOCUMENT_CLASS
                 ),
             )
+
+        except Exception as e:
+            logger.error("%s failed: %s", method_name, str(e))
+            logger.error(traceback.format_exc())
+            return ToolError(
+                message=f"{method_name} failed: {str(e)}. Trace available in server logs."
+            )
+
+    @mcp.tool(
+        name="download_document_content",
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    async def download_document_content(
+        identifier: str,
+        download_folder_path: str,
+    ) -> Union[Dict[str, Any], ToolError]:
+        """
+        Downloads a document's original content (e.g., the raw PDF file) from the
+        content repository to a local folder WITHOUT checking the document out.
+
+        This is a read-only operation: it places NO reservation/lock on the document,
+        so no checkin_document or cancel_document_checkout call is needed afterwards.
+        Use this tool when the original file bytes are needed (e.g., for downstream
+        image or PDF processing) rather than the extracted text.
+
+        :param identifier: The document id or path (required). This can be either the document's ID (GUID)
+                          or its path in the repository (e.g., "/Folder1/document.pdf").
+        :param download_folder_path: Path to the folder where the document content will be saved (required).
+                                    The folder is created if it does not exist.
+
+        :returns: If successful, returns a dictionary containing:
+            - document_id (str): The document's ID.
+            - files (list): One entry per downloaded content element, each containing:
+                - file_path (str): The full path of the downloaded file.
+                - retrieval_name (str): The content element's original file name.
+                - content_type (str): The MIME type of the content.
+                - content_size (int): The size of the content in bytes.
+                 If unsuccessful, returns a ToolError with details about the failure.
+        """
+        method_name = "download_document_content"
+        try:
+            # Prepare the query -- unlike checkoutDocument, this is a plain read
+            # and places no reservation on the document
+            query = """
+            query ($object_store_name: String!, $identifier: String!) {
+                document(repositoryIdentifier: $object_store_name, identifier: $identifier) {
+                    id
+                    className
+                    currentVersion{
+                        contentElements{
+                            ... on ContentTransferType {
+                                retrievalName
+                                contentType
+                                contentSize
+                                downloadUrl
+                            }
+                        }
+                    }
+                }
+            }
+            """
+
+            # Prepare variables for the GraphQL query
+            variables = {
+                "object_store_name": graphql_client.object_store,
+                "identifier": identifier,
+            }
+
+            # Execute the GraphQL query
+            logger.info("Executing document content retrieval")
+            response: Union[ToolError, Dict[str, Any]] = (
+                await graphql_client_execute_async_wrapper(
+                    logger,
+                    method_name,
+                    graphql_client,
+                    query=query,
+                    variables=variables,
+                )
+            )
+            if isinstance(response, ToolError):
+                return response
+
+            # Check if document was found
+            if not response.get("data") or not response["data"].get("document"):
+                return ToolError(
+                    message=f"Document not found with identifier: {identifier}",
+                    suggestions=[
+                        "Check if the document ID or path is correct",
+                        "Verify that the document exists in the repository",
+                        "Try using repository_search tool to find the document by other properties",
+                    ],
+                )
+
+            document = response["data"]["document"]
+            current_version = document.get("currentVersion") or {}
+            content_elements = [
+                element
+                for element in (current_version.get("contentElements") or [])
+                if element.get("downloadUrl")
+            ]
+
+            if not content_elements:
+                return ToolError(
+                    message=f"Document has no downloadable content elements: {identifier}",
+                    suggestions=[
+                        "Verify the document has content (some documents are metadata-only)",
+                        "Use get_document_properties to inspect the document",
+                    ],
+                )
+
+            # download_content_async requires the folder to already exist
+            os.makedirs(download_folder_path, exist_ok=True)
+
+            logger.info(
+                "Found %s content elements to download", len(content_elements)
+            )
+
+            files = []
+            download_errors = []
+
+            for idx, element in enumerate(content_elements):
+                logger.info(
+                    "Downloading content element %s/%s: %s",
+                    idx + 1,
+                    len(content_elements),
+                    element["retrievalName"],
+                )
+
+                download_result = await graphql_client.download_content_async(
+                    download_url=element["downloadUrl"],
+                    download_folder_path=download_folder_path,
+                )
+
+                if download_result["success"]:
+                    files.append(
+                        {
+                            "file_path": download_result["file_path"],
+                            "retrieval_name": element.get("retrievalName"),
+                            "content_type": element.get("contentType"),
+                            "content_size": element.get("contentSize"),
+                        }
+                    )
+                    logger.info(
+                        "Content element %s downloaded to %s",
+                        idx + 1,
+                        download_result["file_path"],
+                    )
+                else:
+                    error_msg = "Failed to download content element %s: %s" % (
+                        idx + 1,
+                        download_result["error"],
+                    )
+                    download_errors.append(error_msg)
+                    logger.warning(error_msg)
+
+            if download_errors:
+                error_message = "%s content downloads failed: %s" % (
+                    len(download_errors),
+                    "; ".join(download_errors),
+                )
+                logger.warning(error_message)
+                return ToolError(
+                    message=error_message,
+                    suggestions=[
+                        "Check if the download folder path is writable",
+                        "Verify network connectivity to the content server",
+                    ],
+                )
+
+            logger.info("Successfully downloaded %s content elements", len(files))
+            return {
+                "document_id": document["id"],
+                "files": files,
+            }
 
         except Exception as e:
             logger.error("%s failed: %s", method_name, str(e))
