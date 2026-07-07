@@ -1,6 +1,6 @@
 [project]
 name = "cs-mcp-server"
-version = "1.0.4.post7"
+version = "1.0.4.post8"
 description = "Content Services MCP Server for FileNet Content Management"
 readme = "README.md"
 authors = [
@@ -22,6 +22,7 @@ dependencies = [
     "requests>=2.31.0",
     "truststore>=0.8.0",
     "pypdf>=6.14.2",
+    "pymupdf>=1.28.0",
 ]
 
 [project.scripts]

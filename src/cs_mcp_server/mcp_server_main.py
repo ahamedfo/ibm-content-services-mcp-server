@@ -50,6 +50,7 @@ from cs_mcp_server.resources.dynamic_resources import (
 from cs_mcp_server.tools.custom_objects import register_custom_object_tools
 from cs_mcp_server.tools.advanced_search import register_advanced_search_tools
 from cs_mcp_server.tools.easement import register_easement_tools
+from cs_mcp_server.tools.extraction import register_extraction_tools
 
 # Configure logging with dynamic level from environment variable
 log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -273,6 +274,7 @@ def register_server_tools(
         register_class_tools(mcp, graphql_client, metadata_cache)
         register_search_tools(mcp, graphql_client, metadata_cache)
         register_easement_tools(mcp)
+        register_extraction_tools(mcp, graphql_client)
         # register_annotation_tools(mcp, graphql_client)
         # register_custom_object_tools(mcp, graphql_client)
         logger.info("Core tools registered")
@@ -306,6 +308,7 @@ def register_server_tools(
         register_property_extraction_tools(mcp, graphql_client, metadata_cache)
         register_classification_tools(mcp, graphql_client, metadata_cache)
         register_easement_tools(mcp)
+        register_extraction_tools(mcp, graphql_client)
         logger.info("All tools registered")
 
     else:
