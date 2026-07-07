@@ -69,6 +69,7 @@ Return ONLY a JSON object (no prose, no markdown fences):
   "pob_from_end": "north" | "south" | "east" | "west" or null,
   "pob_from_corner_ft": 122.93 or null,
   "tie_courses": [{"bearing": "S00-40-01E", "distance_ft": 714.49}, ...],
+  "anchor_source": "prose" | "drawing" | "mixed",
   "legibility": "clean" | "degraded" | "unreadable",
   "notes": "anything ambiguous, illegible, or unusual"
 }
@@ -99,8 +100,13 @@ Rules:
   If the easement starts ON a property boundary at such a labelled distance:
   pob_anchor="parcel_edge", pob_edge=<which boundary: north/south/east/west>,
   pob_from_end=<which end the dimension is measured from>, pob_from_corner_ft=<distance>.
+  The POB tie runs ALONG the same boundary line the easement begins on, from one end of
+  that line to L1's start. Dimensions along PERPENDICULAR side lines (e.g. from a property
+  corner down a side boundary) are corner ties of the property — NOT the POB tie.
   Corner-to-corner or boundary-length dimensions of the PROPERTY itself are NOT the POB
   tie — do not put them in tie_courses.
+- anchor_source: "prose" if the anchor came from written COMMENCING/BEGINNING text,
+  "drawing" if only from dimension labels on a plat, "mixed" if both agree.
 - apn/address/subdivision/lot: only if printed; do NOT guess illegible characters
 - county: infer only from explicit text like "Maricopa County" / "Pima County"
 """
@@ -327,6 +333,7 @@ def register_extraction_tools(mcp: FastMCP, graphql_client: GraphQLClient) -> No
                 "lot": str(out.get("lot")) if out.get("lot") is not None else None,
                 "county": (out.get("county") or "maricopa").lower(),
                 "pob_anchor": out.get("pob_anchor") or "unknown",
+                "anchor_source": out.get("anchor_source") or "unknown",
                 "pob_corner": out.get("pob_corner"),
                 "pob_edge": out.get("pob_edge"),
                 "pob_from_end": out.get("pob_from_end"),

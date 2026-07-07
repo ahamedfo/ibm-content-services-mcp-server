@@ -127,6 +127,56 @@ def _pick_corner(ring: List[List[float]], corner: str) -> Optional[List[float]]:
     return best
 
 
+def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
+    """Even-odd ray casting point-in-polygon test."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > lat) != (yj > lat):
+            x_cross = (xj - xi) * (lat - yi) / (yj - yi) + xi
+            if lon < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _containment_score(
+    verts_local: List[Tuple[float, float]],
+    pob_lon: float,
+    pob_lat: float,
+    parcel_ring: List[List[float]],
+) -> float:
+    """Fraction of the placed easement's test points lying inside the parcel.
+
+    Test points are the traverse vertices plus edge midpoints, nudged slightly
+    toward the easement's own centroid so on-boundary points count as inside.
+    """
+    m_lat, m_lon = _meters_per_degree(pob_lat)
+    pts = []
+    for i in range(len(verts_local) - 1):
+        x1, y1 = verts_local[i]
+        x2, y2 = verts_local[i + 1]
+        pts.append((x1, y1))
+        pts.append(((x1 + x2) / 2, (y1 + y2) / 2))
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    inside = 0
+    for x_ft, y_ft in pts:
+        # nudge ~1 ft toward the centroid to keep boundary points unambiguous
+        dxc, dyc = cx - x_ft, cy - y_ft
+        norm = math.hypot(dxc, dyc) or 1.0
+        xt = x_ft + dxc / norm
+        yt = y_ft + dyc / norm
+        lon = pob_lon + (xt / FT_PER_M) / m_lon
+        lat = pob_lat + (yt / FT_PER_M) / m_lat
+        if _point_in_ring(lon, lat, parcel_ring):
+            inside += 1
+    return inside / len(pts)
+
+
 def _parse_course_rows(rows_json: str, what: str) -> List[Tuple[str, str, float]]:
     """Parse a JSON array of course rows into (label, bearing, distance_ft)."""
     rows = json.loads(rows_json)
@@ -349,50 +399,110 @@ def register_easement_tools(mcp: FastMCP) -> None:
                 edges = _edge_metrics(parcel_ring)
                 max_len = max(e["length_m"] for e in edges)
                 candidates = [e for e in edges if e["length_m"] >= max_len * 0.3]
-                key, reverse = {
+                EDGE_PICK = {
                     "north": ("mid_lat", True),
                     "south": ("mid_lat", False),
                     "east": ("mid_lon", True),
                     "west": ("mid_lon", False),
-                }.get(pob_edge.strip().lower(), (None, None))
-                if key is None:
+                }
+                stated_edge = pob_edge.strip().lower()
+                stated_end = pob_from_end.strip().lower()
+                if stated_edge not in EDGE_PICK:
                     return ToolError(
                         message=f"Invalid pob_edge: {pob_edge!r} (use north/south/east/west)"
                     )
-                edge = sorted(candidates, key=lambda e: e[key], reverse=reverse)[0]
-
-                p1, p2 = edge["p1"], edge["p2"]
-                end = pob_from_end.strip().lower()
-                if end in ("east", "west"):
-                    p_far, p_near = (
-                        (p1, p2) if (p1[0] < p2[0]) == (end == "east") else (p2, p1)
-                    )
-                elif end in ("north", "south"):
-                    p_far, p_near = (
-                        (p1, p2) if (p1[1] < p2[1]) == (end == "north") else (p2, p1)
-                    )
-                else:
+                if stated_end not in ("east", "west", "north", "south"):
                     return ToolError(
                         message=f"Invalid pob_from_end: {pob_from_end!r} (use north/south/east/west)"
                     )
 
-                edge_len_ft = edge["length_m"] * FT_PER_M
-                if pob_from_corner_ft > edge_len_ft:
+                def _place(edge_name, end_name):
+                    key, reverse = EDGE_PICK[edge_name]
+                    edge = sorted(candidates, key=lambda e: e[key], reverse=reverse)[0]
+                    p1, p2 = edge["p1"], edge["p2"]
+                    if end_name in ("east", "west"):
+                        p_far, p_near = (
+                            (p1, p2) if (p1[0] < p2[0]) == (end_name == "east") else (p2, p1)
+                        )
+                    else:
+                        p_far, p_near = (
+                            (p1, p2) if (p1[1] < p2[1]) == (end_name == "north") else (p2, p1)
+                        )
+                    length_ft = edge["length_m"] * FT_PER_M
+                    if pob_from_corner_ft > length_ft:
+                        return None
+                    f = pob_from_corner_ft / length_ft
+                    return (
+                        p_near[0] + (p_far[0] - p_near[0]) * f,
+                        p_near[1] + (p_far[1] - p_near[1]) * f,
+                        length_ft,
+                    )
+
+                # A granted easement lies within the grantor's parcel. Anchors read
+                # off plat drawings are often ambiguous (which edge, which end), so
+                # score every hypothesis by containment and auto-correct a stated
+                # placement that would put the easement outside the parcel.
+                hypotheses = []
+                for en in EDGE_PICK:
+                    ends = ("east", "west") if en in ("north", "south") else ("north", "south")
+                    for endn in ends:
+                        placed = _place(en, endn)
+                        if placed:
+                            score = _containment_score(
+                                verts_local, placed[0], placed[1], parcel_ring
+                            )
+                            # tie-breaks: keep the stated end, then the stated edge
+                            hypotheses.append(
+                                (
+                                    -score,
+                                    0 if endn == stated_end else 1,
+                                    0 if en == stated_edge else 1,
+                                    en,
+                                    endn,
+                                    placed,
+                                )
+                            )
+                if not hypotheses:
                     return ToolError(
                         message=(
-                            f"pob_from_corner_ft ({pob_from_corner_ft}) exceeds the parcel's "
-                            f"{pob_edge} edge length ({edge_len_ft:.2f} ft)"
+                            f"pob_from_corner_ft ({pob_from_corner_ft}) exceeds every "
+                            "candidate parcel edge length"
                         ),
-                        suggestions=[
-                            "Verify the tie dimension and the pob_edge/pob_from_end choice"
-                        ],
+                        suggestions=["Verify the tie dimension"],
                     )
-                frac = pob_from_corner_ft / edge_len_ft
-                pob_lon = p_near[0] + (p_far[0] - p_near[0]) * frac
-                pob_lat = p_near[1] + (p_far[1] - p_near[1]) * frac
+                hypotheses.sort()
+                best_score = -hypotheses[0][0]
+                stated_placed = _place(stated_edge, stated_end)
+                stated_score = (
+                    _containment_score(
+                        verts_local, stated_placed[0], stated_placed[1], parcel_ring
+                    )
+                    if stated_placed
+                    else -1.0
+                )
+                correction = ""
+                if stated_placed and stated_score >= best_score - 0.15:
+                    use_edge, use_end = stated_edge, stated_end
+                    pob_lon, pob_lat, edge_len_ft = stated_placed
+                else:
+                    _, _, _, use_edge, use_end, placed = hypotheses[0]
+                    pob_lon, pob_lat, edge_len_ft = placed
+                    if (use_edge, use_end) != (stated_edge, stated_end):
+                        correction = (
+                            f" [auto-corrected from {stated_edge}/{stated_end}: that "
+                            f"placement left the easement outside the parcel "
+                            f"(containment {max(stated_score, 0):.0%} vs {best_score:.0%})]"
+                        )
+                        logger.info(
+                            "parcel_edge anchor auto-corrected %s/%s -> %s/%s",
+                            stated_edge,
+                            stated_end,
+                            use_edge,
+                            use_end,
+                        )
                 anchor_detail = (
-                    f"{pob_from_corner_ft} ft from the {end} end of the parcel's "
-                    f"{pob_edge} edge ({edge_len_ft:.2f} ft long)"
+                    f"{pob_from_corner_ft} ft from the {use_end} end of the parcel's "
+                    f"{use_edge} edge ({edge_len_ft:.2f} ft long)" + correction
                 )
 
             elif anchor == "parcel_corner":
