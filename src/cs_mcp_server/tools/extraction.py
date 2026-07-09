@@ -95,6 +95,14 @@ Rules:
     corner or line end -> set pob_edge, pob_from_end, pob_from_corner_ft
   * "unknown" if you cannot tell — do NOT guess
 - tie_courses are the COMMENCING->POB walk only; never duplicate line_table rows there
+- CRITICAL: statements like "FROM WHICH the <corner> BEARS <bearing>, A DISTANCE OF
+  <distance>" are reference/basis-of-bearing statements describing where a landmark lies —
+  nobody walks them. NEVER include them in tie_courses or line_table.
+- tie_courses = ONLY the "THENCE ..." courses between the COMMENCING point and the words
+  "TO THE POINT OF BEGINNING". line_table = ONLY the courses AFTER the Point of Beginning,
+  tracing the easement boundary back around to the Point of Beginning.
+- Capture EVERY course to the end of the description ("...to the Point of Beginning") —
+  do not stop early; a closed boundary usually has 4 or more courses.
 - PLAT DRAWINGS: the Point of Beginning is where course L1 STARTS. Look for a dimension
   label from a property line end or corner to that exact starting point (e.g. "122.93'").
   If the easement starts ON a property boundary at such a labelled distance:
@@ -110,6 +118,87 @@ Rules:
 - apn/address/subdivision/lot: only if printed; do NOT guess illegible characters
 - county: infer only from explicit text like "Maricopa County" / "Pima County"
 """
+
+
+_PROSE_BEARING = re.compile(
+    r"(NORTH|SOUTH)\s+(\d{1,3})\s+DEGREES?\s+(\d{1,2})\s+MINUTES?\s+([\d.]+)\s+"
+    r"SECONDS?\s+(EAST|WEST)",
+    re.I,
+)
+# FEET with OCR tolerance (FEET/FEEL/FEE/FT — scanned deeds garble the word)
+_DIST_AFTER = re.compile(r"([\d,]+\.\d+|\d[\d,]*)\s*(?:FE[E3][TL]?|FT)\b", re.I)
+
+
+def _parse_prose_segment(segment: str) -> List[Dict[str, Any]]:
+    """Deterministically parse 'THENCE <bearing>, <distance> FEET' courses from
+    metes-and-bounds prose. Skips 'FROM WHICH ... BEARS ...' reference bearings."""
+    courses = []
+    for m in _PROSE_BEARING.finditer(segment):
+        lead = segment[max(0, m.start() - 140) : m.start()].upper()
+        if "FROM WHICH" in lead or "BEARS" in lead.split("THENCE")[-1]:
+            continue  # reference/basis-of-bearing statement, not a walked course
+        tail = segment[m.end() : m.end() + 120]
+        dm = _DIST_AFTER.search(tail)
+        if not dm:
+            continue
+        ns, deg, minutes, seconds, ew = m.groups()
+        bearing = f"{ns[0].upper()}{int(deg):02d}-{int(minutes):02d}-{int(float(seconds)):02d}{ew[0].upper()}"
+        courses.append(
+            {
+                "bearing": bearing,
+                "distance_ft": float(dm.group(1).replace(",", "")),
+            }
+        )
+    return courses
+
+
+def _parse_prose_traverse(full_text: str) -> Optional[Dict[str, Any]]:
+    """If the document text contains a standard metes-and-bounds description,
+    parse it deterministically. Two boilerplate shapes:
+      COMMENCING AT <landmark> ... TO THE POINT OF BEGINNING; THENCE <boundary
+      courses> ... TO THE POINT OF BEGINNING   -> ties + boundary
+      BEGINNING AT <corner> ... THENCE <boundary courses> ... TO THE POINT OF
+      BEGINNING                                 -> boundary only (POB is a corner)
+    Returns None when the pattern isn't present."""
+    text = re.sub(r"\s+", " ", full_text)
+    upper = text.upper()
+    if "COMMENCING" in upper:
+        start = upper.find("COMMENCING")
+        pob = upper.find("POINT OF BEGINNING", start)
+        if pob < 0:
+            return None
+        ties = _parse_prose_segment(text[start:pob])
+        seg_start = pob + len("POINT OF BEGINNING")
+    else:
+        m = re.search(r"BEGINNING\s+AT", upper)
+        if not m:
+            return None
+        ties = []
+        seg_start = m.end()
+    end = upper.find("POINT OF BEGINNING", seg_start)
+    seg = text[seg_start : end + 20] if end > 0 else text[seg_start:]
+    boundary = _parse_prose_segment(seg)
+    if not boundary:
+        return None
+    return {"ties": ties, "boundary": boundary}
+
+
+def _detect_prose_anchor(full_text: str) -> Dict[str, Optional[str]]:
+    """Deterministic anchor hints from boilerplate prose."""
+    upper = re.sub(r"\s+", " ", full_text).upper()
+    out: Dict[str, Optional[str]] = {"pob_anchor": None, "pob_corner": None}
+    CORNERS = {
+        "NORTHWEST": "NW", "NORTHEAST": "NE", "SOUTHWEST": "SW", "SOUTHEAST": "SE",
+    }
+    m = re.search(
+        r"(?:COMMENCING|BEGINNING)\s+AT\s+(?:THE\s+)?(?:A\s+)?(?:FOUND\s+[A-Z ]+?\s+AT\s+THE\s+)?"
+        r"(NORTHWEST|NORTHEAST|SOUTHWEST|SOUTHEAST)\s+CORNER\s+OF\s+(SAID\s+)?(LOT|SECTION)",
+        upper,
+    )
+    if m:
+        out["pob_corner"] = CORNERS[m.group(1)]
+        out["pob_anchor"] = "section_corner" if m.group(3) == "SECTION" else "parcel_corner"
+    return out
 
 
 def _closure(rows: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
@@ -232,11 +321,14 @@ def register_extraction_tools(mcp: FastMCP, graphql_client: GraphQLClient) -> No
             # scans, exhibits usually live at the END of recorded documents.
             KEYWORDS = ("THENCE", "LINE TABLE", "EXHIBIT", "APN", "COMMENCING", "BEGINNING")
             scored = []
+            full_text = ""
             for i in range(page_count):
                 try:
-                    text = (doc[i].get_text() or "").upper()
+                    page_text = doc[i].get_text() or ""
                 except Exception:
-                    text = ""
+                    page_text = ""
+                full_text += page_text + "\n"
+                text = page_text.upper()
                 score = sum(k in text for k in KEYWORDS)
                 scored.append((score, i))
             has_text = any(s for s, _ in scored)
@@ -296,13 +388,53 @@ def register_extraction_tools(mcp: FastMCP, graphql_client: GraphQLClient) -> No
 
             out = await call_vision()
             rows = out.get("line_table") or []
+            tie_rows = out.get("tie_courses") or []
+            segmentation = "model"
+
+            # The model proposes; deterministic code disposes. When the document
+            # has a readable metes-and-bounds description, parse it directly —
+            # boilerplate surveyor grammar beats model segmentation variance.
+            prose = _parse_prose_traverse(full_text) if full_text.strip() else None
+            if prose:
+                # Prose ties are reliable even when OCR mangles boundary distances
+                # (ties have no closure check to save them; the deterministic
+                # FROM-WHICH filter is what makes them trustworthy).
+                tie_rows = prose["ties"]
+                segmentation = "model+prose_ties"
+                pc = _closure(prose["boundary"])
+                if _closes(pc):
+                    rows = prose["boundary"]
+                    segmentation = "prose"
+                logger.info(
+                    "Deterministic prose parse: %d boundary (closes=%s) + %d ties",
+                    len(prose["boundary"]),
+                    _closes(pc),
+                    len(tie_rows),
+                )
+
             check = _closure(rows) if rows else None
             closure_ok = _closes(check)
+
             if rows and not closure_ok:
-                # One retry after the provider's per-minute token window resets.
-                # If the retry itself fails (e.g. rate limit), keep pass-1 results
-                # with closure_ok=False rather than losing everything.
-                logger.info("Traverse from first pass does not close; retrying once")
+                # Re-segmentation repair: models often shuffle courses between the
+                # tie walk and the boundary. Some suffix of (ties + boundary) is
+                # usually the true closed polygon.
+                combined = tie_rows + rows
+                for k in range(len(combined) - 2):
+                    cand = combined[k:]
+                    cc = _closure(cand)
+                    if _closes(cc):
+                        rows, tie_rows = cand, combined[:k]
+                        check, closure_ok = cc, True
+                        segmentation = "resegmented"
+                        logger.info("Re-segmented traverse: %d ties + %d boundary", k, len(cand))
+                        break
+
+            if rows and not closure_ok:
+                # One vision retry after the provider's per-minute token window
+                # resets. If it fails (e.g. rate limit), keep pass-1 results with
+                # closure_ok=False rather than losing everything.
+                logger.info("Traverse does not close; retrying vision pass once")
                 try:
                     await _asyncio.sleep(65)
                     out2 = await call_vision()
@@ -310,12 +442,18 @@ def register_extraction_tools(mcp: FastMCP, graphql_client: GraphQLClient) -> No
                     check2 = _closure(rows2) if rows2 else None
                     if _closes(check2):
                         out, rows, check, closure_ok = out2, rows2, check2, True
+                        tie_rows = out2.get("tie_courses") or []
+                        segmentation = "model_retry"
                 except Exception as retry_err:
                     logger.warning("Extraction retry failed: %s", str(retry_err)[:150])
 
+            # Deterministic anchor hints from boilerplate prose override the model.
+            anchor_hint = _detect_prose_anchor(full_text) if full_text.strip() else {}
+            pob_anchor_final = anchor_hint.get("pob_anchor") or out.get("pob_anchor") or "unknown"
+            pob_corner_final = anchor_hint.get("pob_corner") or out.get("pob_corner")
+
             # ---------------- 4. flatten into map_easement_to_parcel-ready fields
             str_info = out.get("section_township_range") or {}
-            tie_rows = out.get("tie_courses") or []
             result = {
                 "document_id": document["id"],
                 "page_count": page_count,
@@ -332,9 +470,10 @@ def register_extraction_tools(mcp: FastMCP, graphql_client: GraphQLClient) -> No
                 "subdivision": out.get("subdivision"),
                 "lot": str(out.get("lot")) if out.get("lot") is not None else None,
                 "county": (out.get("county") or "maricopa").lower(),
-                "pob_anchor": out.get("pob_anchor") or "unknown",
-                "anchor_source": out.get("anchor_source") or "unknown",
-                "pob_corner": out.get("pob_corner"),
+                "pob_anchor": pob_anchor_final,
+                "anchor_source": ("prose" if anchor_hint.get("pob_anchor") else out.get("anchor_source")) or "unknown",
+                "segmentation": segmentation,
+                "pob_corner": pob_corner_final,
                 "pob_edge": out.get("pob_edge"),
                 "pob_from_end": out.get("pob_from_end"),
                 "pob_from_corner_ft": out.get("pob_from_corner_ft"),
