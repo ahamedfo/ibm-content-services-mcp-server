@@ -354,7 +354,7 @@ wheels = [
 
 [[package]]
 name = "cs-mcp-server"
-version = "1.0.4.post10"
+version = "1.0.4.post11"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

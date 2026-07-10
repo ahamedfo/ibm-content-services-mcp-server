@@ -339,48 +339,72 @@ def register_easement_tools(mcp: FastMCP) -> None:
             def esc(v: str) -> str:
                 return v.replace("'", "''")
 
-            where = None
+            # Try EVERY available identification method before giving up —
+            # documents often carry several, and any one may be absent from or
+            # formatted differently in the county's records.
+            SUFFIXES = {
+                "CIRCLE", "CIR", "ROAD", "RD", "DRIVE", "DR", "STREET", "ST",
+                "LANE", "LN", "AVENUE", "AVE", "WAY", "PLACE", "PL", "COURT",
+                "CT", "BOULEVARD", "BLVD", "TRAIL", "TRL", "PARKWAY", "PKWY",
+            }
+            attempts = []
             if apn.strip():
-                where, parcel_found_by = f"{adapter['apn_field']}='{esc(apn.strip())}'", "apn"
-            elif address.strip():
-                where = (
-                    f"UPPER({adapter['address_field']}) LIKE "
-                    f"UPPER('%{esc(address.strip())}%')"
+                attempts.append(("apn", f"{adapter['apn_field']}='{esc(apn.strip())}'"))
+            if address.strip():
+                words = address.strip().split()
+                # county records abbreviate suffixes (CIRCLE -> CIR); match on
+                # the stable prefix instead
+                core = (
+                    " ".join(words[:-1])
+                    if len(words) > 1 and words[-1].upper().strip(".") in SUFFIXES
+                    else address.strip()
                 )
-                parcel_found_by = "address"
-            elif subdivision.strip() and lot.strip():
-                where = (
-                    f"UPPER({adapter['subdivision_field']}) LIKE "
-                    f"UPPER('%{esc(subdivision.strip())}%') "
-                    f"AND {adapter['lot_field']}='{esc(lot.strip())}'"
+                attempts.append(
+                    (
+                        "address",
+                        f"UPPER({adapter['address_field']}) LIKE UPPER('%{esc(core)}%')",
+                    )
                 )
-                parcel_found_by = "subdivision+lot"
+            if subdivision.strip() and lot.strip():
+                attempts.append(
+                    (
+                        "subdivision+lot",
+                        f"UPPER({adapter['subdivision_field']}) LIKE "
+                        f"UPPER('%{esc(subdivision.strip())}%') "
+                        f"AND {adapter['lot_field']}='{esc(lot.strip())}'",
+                    )
+                )
 
-            if where:
+            tried = []
+            for method, where in attempts:
                 url = (
                     f"{adapter['parcel_url']}?where={quote(where)}"
                     f"&outFields={adapter['apn_field']},{adapter['owner_field']}"
                     "&returnGeometry=true&outSR=4326&f=json"
                 )
-                logger.info("Querying %s parcel GIS by %s", county, parcel_found_by)
+                logger.info("Querying %s parcel GIS by %s", county, method)
                 gis = await _gis_query(url)
                 features = gis.get("features") or []
+                tried.append(method)
                 if features:
                     parcel_ring = features[0]["geometry"]["rings"][0]
                     attrs = features[0]["attributes"]
                     owner = attrs.get(adapter["owner_field"])
                     apn = attrs.get(adapter["apn_field"]) or apn
-                elif anchor != "section_corner":
-                    return ToolError(
-                        message=(
-                            f"No parcel found in {county} county GIS "
-                            f"(searched by {parcel_found_by})"
-                        ),
-                        suggestions=[
-                            "Check the APN format (Maricopa uses dashes: 200-18-001S)",
-                            "Try the street address or subdivision+lot printed in the document",
-                        ],
-                    )
+                    parcel_found_by = method
+                    break
+
+            if parcel_ring is None and tried and anchor != "section_corner":
+                return ToolError(
+                    message=(
+                        f"No parcel found in {county} county GIS "
+                        f"(searched by {', '.join(tried)})"
+                    ),
+                    suggestions=[
+                        "Check the APN format (Maricopa uses dashes: 200-18-001S)",
+                        "Try the street address or subdivision+lot printed in the document",
+                    ],
+                )
 
             if parcel_ring is None and anchor in ("parcel_edge", "parcel_corner"):
                 return ToolError(

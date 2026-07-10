@@ -1,6 +1,6 @@
 [project]
 name = "cs-mcp-server"
-version = "1.0.4.post10"
+version = "1.0.4.post11"
 description = "Content Services MCP Server for FileNet Content Management"
 readme = "README.md"
 authors = [
